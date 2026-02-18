@@ -17,8 +17,8 @@ Minimal, low-noise network service fingerprinting tool using conservative banner
 
 ```bash
 # clone
-git clone https://github.com/<you>/barescan.git
-cd barescan
+git clone https://github.com/1337leets/BareScan.git
+cd BareScan
 
 # run (python 3.8+ recommended)
 python3 barescan.py example.com -p 22,80,3306 --fingerprint --banner --json results.json
