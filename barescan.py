@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-
 """
 BareScan — Minimal, low-noise service fingerprinting via conservative banner grabbing.
 
 Features:
   - Banner grabbing (--banner)
   - Service fingerprinting (--fingerprint)
-  - JSON output (--json)
+  - JSON output (--json), with optional base64 raw banner (--raw)
   - Centralized PRODUCT_PATTERNS and mapping tables for easy extension
-  - Debian package token → Debian version mapping (debNN → Debian NN)
+  - Debian package token -> Debian version mapping (debNN -> Debian NN)
   - Preservation of packaging/revision tokens in fp_version (parentheses)
   - Recognition of common services (Dovecot, OpenSSH, Caddy, Apache, IIS, MariaDB, etc.)
+  - Evidence-based TCP state model: open / closed / filtered via connect() errno
+  - OPEN/NO-DATA: handshake completed but no application data (responsive flag)
+  - Network-interference hints: upstream SYN-proxy/tarpit and ISP transparent-proxy
 
 Responsible use:
   - Run only against systems you own or are explicitly authorized to test.
@@ -18,11 +20,12 @@ Responsible use:
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import base64
 import concurrent.futures
+import errno
 import json
 import math
 import re
@@ -64,6 +67,15 @@ PRODUCT_PATTERNS: List[Tuple[re.Pattern, str, Optional[int]]] = [
     (re.compile(r"openssh[_\-/ ]?([0-9A-Za-z\.\-p]+)", re.I), "OpenSSH", 1),
     (re.compile(r"dovecot(?:/|\s)?([0-9]+\.[0-9]+(?:\.[0-9]+)?)?", re.I), "Dovecot", 1),
     (re.compile(r"exim(?:/|\s)?([0-9]+\.[0-9]+(?:\.[0-9]+)?)?", re.I), "Exim", 1),
+    # CDN / edge / LB platforms — no meaningful version exposed, g=None
+    (re.compile(r"\bcloudflare\b", re.I), "Cloudflare", None),
+    (re.compile(r"\bvercel\b", re.I), "Vercel", None),
+    (re.compile(r"\bakamai\b", re.I), "Akamai", None),
+    (re.compile(r"\bfastly\b", re.I), "Fastly", None),
+    (re.compile(r"\bawselb\b", re.I), "AWS ELB", None),
+    (re.compile(r"\bawsalb\b", re.I), "AWS ALB", None),
+    (re.compile(r"\bnginx-cloudfront\b", re.I), "CloudFront", None),
+    (re.compile(r"\bcloudfront\b", re.I), "CloudFront", None),
     # add more as needed
 ]
 
@@ -115,6 +127,54 @@ def _parse_timeout(value: str) -> float:
 
 def resolve_target(host: str) -> str:
     return socket.gethostbyname(host)
+
+def parse_target_url(raw: str) -> dict:
+    """
+    Parse a raw target string that may be a URL, hostname, or IP.
+    Returns dict with:
+      'host'   : clean hostname or IP (no scheme, no path, no port)
+      'scheme' : 'https' | 'http' | '' 
+      'port'   : int port from URL (e.g. 8080) or None
+    Examples:
+      'https://google.com'                    → host='google.com',  scheme='https', port=None
+      'http://example.com:8080/path?q=1'      → host='example.com', scheme='http',  port=8080
+      'https://rp-tamganews.vercel.app'       → host='rp-tamganews.vercel.app', scheme='https', port=None
+      'google.com'                            → host='google.com',  scheme='',      port=None
+      '192.168.1.1'                           → host='192.168.1.1', scheme='',      port=None
+      'google.com:9090'                       → host='google.com',  scheme='',      port=9090
+    """
+    scheme = ""
+    port = None
+
+    # strip leading/trailing whitespace
+    s = raw.strip()
+
+    # extract scheme if present
+    m_scheme = re.match(r"^(https?)://(.+)$", s, flags=re.I)
+    if m_scheme:
+        scheme = m_scheme.group(1).lower()
+        s = m_scheme.group(2)   # everything after '://'
+
+    # strip path and query: keep only host[:port]
+    s = s.split("/")[0]    # drop /path
+    s = s.split("?")[0]    # drop ?query (shouldn't survive split above but be safe)
+    s = s.split("#")[0]    # drop #fragment
+
+    # extract port if present (handle IPv6 [::1]:port separately)
+    if s.startswith("["):
+        # IPv6 literal: [::1] or [::1]:port
+        m_v6 = re.match(r"^\[([^\]]+)\](?::(\d+))?$", s)
+        if m_v6:
+            s = m_v6.group(1)
+            if m_v6.group(2):
+                port = int(m_v6.group(2))
+    else:
+        parts = s.rsplit(":", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            s = parts[0]
+            port = int(parts[1])
+
+    return {"host": s, "scheme": scheme, "port": port}
 
 def _parse_mysql_handshake_raw(raw: bytes) -> dict:
     """
@@ -189,23 +249,155 @@ def build_dns_query_qname(name: Optional[str] = None) -> bytes:
     qname += b"\x00"
     return header + qname + b"\x00\x01\x00\x01"
 
+def _parse_ntp_response(data: bytes) -> Dict[str, Any]:
+    """
+    48-byte NTP response → structured fields + readable summary.
+    Returns dict with 'summary' (str) and parsed numeric fields, or empty dict on failure.
+    """
+    if not data or len(data) < 4:
+        return {}
+    try:
+        import struct
+        li_vn_mode = data[0]
+        li      = (li_vn_mode >> 6) & 0x3
+        vn      = (li_vn_mode >> 3) & 0x7
+        mode    = li_vn_mode & 0x7
+        stratum = data[1]
+        out: Dict[str, Any] = {
+            "ntp_li": li, "ntp_version": vn, "ntp_mode": mode, "ntp_stratum": stratum,
+        }
+        if len(data) >= 16:
+            ref_id = data[12:16]
+            # Stratum 0/1: ASCII identifier (GPS, PPS, ATOM, etc.)
+            # Stratum >=2: upstream server IPv4
+            if stratum <= 1:
+                try:
+                    ref_str = ref_id.decode("ascii").rstrip("\x00").strip()
+                    if not ref_str or not all(c.isprintable() for c in ref_str):
+                        ref_str = ".".join(str(b) for b in ref_id)
+                except Exception:
+                    ref_str = ".".join(str(b) for b in ref_id)
+            else:
+                ref_str = ".".join(str(b) for b in ref_id)
+            out["ntp_ref"] = ref_str
+        if len(data) >= 12:
+            poll = data[2]
+            out["ntp_poll"] = poll
+        # Build readable summary
+        summary = f"NTPv{vn} stratum={stratum}"
+        if out.get("ntp_ref"):
+            summary += f" ref={out['ntp_ref']}"
+        out["summary"] = summary
+        return out
+    except Exception:
+        return {}
+
+def _parse_dns_response(data: bytes, query_for: str = "") -> Dict[str, Any]:
+    """
+    DNS response → first A/AAAA record + summary.
+    Returns dict with 'summary' (str) and parsed fields, or empty dict on failure.
+    """
+    if not data or len(data) < 12:
+        return {}
+    try:
+        import struct
+        flags   = struct.unpack(">H", data[2:4])[0]
+        qdcount = struct.unpack(">H", data[4:6])[0]
+        ancount = struct.unpack(">H", data[6:8])[0]
+        rcode   = flags & 0x000f
+        rcode_names = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
+                       4: "NOTIMP", 5: "REFUSED"}
+        out: Dict[str, Any] = {
+            "dns_qdcount": qdcount, "dns_ancount": ancount,
+            "dns_rcode": rcode, "dns_rcode_name": rcode_names.get(rcode, str(rcode)),
+        }
+        if ancount == 0:
+            if rcode != 0:
+                out["summary"] = f"DNS {out['dns_rcode_name']}"
+            else:
+                out["summary"] = f"DNS response (no answers)"
+            return out
+
+        # Skip question section: walk qname, then qtype(2) + qclass(2)
+        pos = 12
+        for _ in range(qdcount):
+            while pos < len(data):
+                l = data[pos]
+                if l == 0:
+                    pos += 1
+                    break
+                elif (l & 0xc0) == 0xc0:   # compression pointer
+                    pos += 2
+                    break
+                pos += 1 + l
+            pos += 4   # qtype + qclass
+
+        # Parse first answer
+        answers = []
+        for _ in range(ancount):
+            if pos >= len(data):
+                break
+            # answer name (may be pointer or labels)
+            l = data[pos]
+            if (l & 0xc0) == 0xc0:
+                pos += 2
+            else:
+                while pos < len(data) and data[pos] != 0:
+                    if (data[pos] & 0xc0) == 0xc0:
+                        pos += 2
+                        break
+                    pos += 1 + data[pos]
+                else:
+                    pos += 1
+            if pos + 10 > len(data):
+                break
+            rtype  = struct.unpack(">H", data[pos:pos+2])[0]
+            rclass = struct.unpack(">H", data[pos+2:pos+4])[0]
+            ttl    = struct.unpack(">I", data[pos+4:pos+8])[0]
+            rdlen  = struct.unpack(">H", data[pos+8:pos+10])[0]
+            pos   += 10
+            if pos + rdlen > len(data):
+                break
+            rdata = data[pos:pos+rdlen]
+            pos += rdlen
+            if rtype == 1 and rdlen == 4:   # A
+                ip = ".".join(str(b) for b in rdata)
+                answers.append(("A", ip))
+            elif rtype == 28 and rdlen == 16:   # AAAA
+                groups = [rdata[i:i+2].hex() for i in range(0, 16, 2)]
+                answers.append(("AAAA", ":".join(groups)))
+
+        out["dns_answers"] = answers
+        if answers:
+            first_type, first_val = answers[0]
+            if query_for:
+                out["summary"] = f"{query_for} → {first_val} ({first_type})"
+            else:
+                out["summary"] = f"{first_val} ({first_type})"
+        else:
+            out["summary"] = f"DNS response ({ancount} answer{'s' if ancount>1 else ''})"
+        return out
+    except Exception:
+        return {}
+
 # ------------------------
 # Improved Debian/Ubuntu token extractors
 # ------------------------
 def _extract_debian_from_text(s: str) -> Optional[str]:
     """
     Prefer 'debNN' packaging token (deb11, deb10u2, etc.) as the Debian major version.
-    Fallback to explicit 'Debian-<num>' only if 'debNN' not found.
+    Fallback to 'Debian NN' (whitespace only) — hyphen-separated 'Debian-7' is a
+    package revision number, NOT a Debian release, so it is intentionally excluded.
     Returns numeric major version as string (e.g. '11') or None.
     """
     if not s:
         return None
-    # Look for 'deb' followed by 1-2 digits (captures deb11 in deb11u5)
+    # Primary: deb11, deb12u3, etc.
     m = re.search(r"deb(\d{1,2})(?=[^\d]|$)", s, flags=re.I)
     if m:
         return m.group(1)
-    # Fallback: 'Debian-<num>' or 'Debian <num>'
-    m2 = re.search(r"\bDebian[-_\s]*([0-9]{1,2})(?:\b|[^\d])", s, flags=re.I)
+    # Fallback: 'Debian 11' or 'Debian GNU/Linux 12' — whitespace separator only
+    m2 = re.search(r"\bDebian\s+(?:GNU/Linux\s+)?([0-9]{1,2})\b", s, flags=re.I)
     if m2:
         return m2.group(1)
     return None
@@ -233,22 +425,20 @@ def _extract_ubuntu_from_text(s: str) -> Optional[str]:
 
 def _recv_select_wait(sock: socket.socket, timeout: float, bufsize: int = 8192) -> bytes:
     """
-    More reliable recv:
-  - Waits until the socket becomes readable using select (up to total `timeout`)
-  - Reads the first available data, then performs a short drain to collect extra bytes
-    Returns:
-  The received bytes (may be empty).
+    Daha güvenilir recv: select ile socket okunabilir olana kadar bekler (toplam `timeout` süresi boyunca),
+    ilk veri geldiğinde okur ve kısa bir 'drain' ile ek baytları toplar.
+    Return: alınan bytes (boş olabilir).
     """
     if timeout is None or timeout <= 0:
         timeout = 1.0
     end = time.time() + float(timeout)
     out = b""
-    # Loop: use small, increasing waits (minimize busy-wait; total time bounded by timeout)
+    # Döngü: artan küçük beklemeler kullan (minimize busy-wait, toplam süre timeout)
     while time.time() < end:
         remaining = max(0.01, end - time.time())
         rlist, _, _ = select.select([sock], [], [], remaining)
         if not rlist:
-            # select timeout, retry again
+            # select timeout, tekrar dene
             continue
         try:
             part = sock.recv(bufsize)
@@ -256,7 +446,7 @@ def _recv_select_wait(sock: socket.socket, timeout: float, bufsize: int = 8192) 
                 # connection closed by peer
                 break
             out += part
-            # Attempt to drain any remaining data within a short time window
+            # kısa bir zaman diliminde kalan veriyi de almaya çalış (drain)
             try:
                 sock.setblocking(0)
                 while True:
@@ -283,27 +473,36 @@ def _recv_select_wait(sock: socket.socket, timeout: float, bufsize: int = 8192) 
             break
     return out
 
-def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[str] = None) -> Tuple[str, bytes]:
+def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[str] = None, existing_sock: Optional[socket.socket] = None) -> Tuple[str, bytes]:
     """
-    More reliable banner probing strategy:
-  - Connect, then perform an immediate select-based recv (short window)
-  - Use a port-specific gentle probe (HEAD, EHLO, newline, etc.)
-  - For HTTP: wait after HEAD; if empty, fall back to GET
-  - Overall wait behavior is bounded by `timeout`
+    Daha güvenilir banner probe:
+      - existing_sock verilirse yeni bağlantı açılmaz, mevcut bağlantı kullanılır
+      - connect, immediate select-based recv (kısa süre)
+      - port'a özgü gentle probe (HEAD, EHLO, newline, vs.)
+      - HEAD => bekle; eğer boşsa GET fallback (HTTP için)
+      - toplam bekleme davranışı `timeout` ile sınırlı
     """
     raw = b""
     preview = ""
+    _owns_sock = existing_sock is None  # sadece kendi açtığımız soketi kapatırız
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(min( max(timeout, 0.1 ), 10.0 ))
-        try:
-            s.connect((ip, port))
-        except Exception:
+        if existing_sock is not None:
+            s = existing_sock
             try:
-                s.close()
+                s.settimeout(min(max(timeout, 0.1), 10.0))
             except Exception:
                 pass
-            return ("", b"")
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(min( max(timeout, 0.1 ), 10.0 ))
+            try:
+                s.connect((ip, port))
+            except Exception:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                return ("", b"")
 
         def mk_preview(b: bytes) -> str:
             try:
@@ -341,7 +540,7 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
             preview = mk_preview(data) if data else ""
             if not data:
                 # fallback to GET which some servers handle while HEAD ignored
-                getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: barescan/1.0\r\nConnection: close\r\n\r\n".encode()
+                getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: meintool/1.0\r\nConnection: close\r\n\r\n".encode()
                 data = _send_and_wait(s, getr, max(0.5, timeout))
                 raw = data or raw
                 preview = mk_preview(data) if data else preview
@@ -349,15 +548,22 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
         # HTTPS: wrap then do same HEAD->GET fallback
         elif port in (443, 8443):
             try:
+                # SSL handshake may need more time than the default.
+                # Add a fixed buffer rather than multiplying — keeps scan predictable.
+                ssl_timeout = min(timeout + 1.5, 5.0)
+                try:
+                    s.settimeout(ssl_timeout)
+                except Exception:
+                    pass
                 ctx = ssl.create_default_context()
                 ss = ctx.wrap_socket(s, server_hostname=host_header or ip)
-                ss.settimeout(min(max(timeout, 0.1), 10.0))
+                ss.settimeout(min(max(timeout, 0.5), 10.0))
                 head = f"HEAD / HTTP/1.0\r\nHost: {host_hdr}\r\nConnection: close\r\n\r\n".encode()
                 data = _send_and_wait(ss, head, max(0.5, timeout))
                 raw = data or raw
                 preview = mk_preview(data) if data else ""
                 if not data:
-                    getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: barescan/1.0\r\nConnection: close\r\n\r\n".encode()
+                    getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: meintool/1.0\r\nConnection: close\r\n\r\n".encode()
                     data = _send_and_wait(ss, getr, max(0.5, timeout))
                     raw = data or raw
                     preview = mk_preview(data) if data else preview
@@ -366,7 +572,7 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
                 except Exception:
                     pass
             except Exception:
-                # SSL handshake/wrap hatası -> geri dön normal soket ile (raw) data varsa onu kullan
+                # SSL handshake/wrap hatası -> sessizce devam et
                 pass
 
         # SMTP
@@ -577,15 +783,15 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
         # SIP (TCP 5060) - send lightweight OPTIONS (application-level); optional but useful
         elif port == 5060:
             try:
-                callid = f"barescan-{int(time.time()*1000)}"
+                callid = f"meintool-{int(time.time()*1000)}"
                 opts = (
                     f"OPTIONS sip:{host_hdr} SIP/2.0\r\n"
                     f"Via: SIP/2.0/TCP {host_hdr};branch=z9hG4bK{callid}\r\n"
-                    f"From: <sip:barescan@{host_hdr}>;tag=mt{callid}\r\n"
+                    f"From: <sip:meintool@{host_hdr}>;tag=mt{callid}\r\n"
                     f"To: <sip:{host_hdr}>\r\n"
                     f"Call-ID: {callid}\r\n"
                     f"CSeq: 1 OPTIONS\r\n"
-                    f"Contact: <sip:barescan@{host_hdr}>\r\n"
+                    f"Contact: <sip:meintool@{host_hdr}>\r\n"
                     f"Max-Forwards: 70\r\n"
                     f"Content-Length: 0\r\n\r\n"
                 ).encode()
@@ -600,7 +806,7 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
                 pass
 
         # LDAP (389) - **optional**; LDAP uses BER binary frames — non-textual.
-        # This is more intrusive; include only when explicitly enabled. Here, only a short recv is attempted first.
+        # This is more intrusive; include only if you opt-in. Below we just try a short recv first.
         elif port == 389:
             try:
                 data = s.recv(4096)
@@ -615,10 +821,11 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
             raw = data or raw
             preview = mk_preview(data) if data else preview
 
-        try:
-            s.close()
-        except Exception:
-            pass
+        if _owns_sock:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     except Exception:
         return ("", b"")
@@ -672,7 +879,9 @@ def fingerprint_banner(port: int, banner_text: str, raw_bytes: Optional[bytes] =
                         ver = m.group(g).strip()
                 except Exception:
                     ver = ""
-                ver = ver or "?"
+                # "?" only when version group exists but couldn't be captured.
+                # If g is None the product genuinely has no version (e.g. Cloudflare).
+                ver = ver or ("?" if g is not None else "")
                 # build fp_version with packaging/distrib token if present
                 display_paren = ""
                 if distro_raw:
@@ -703,7 +912,29 @@ def fingerprint_banner(port: int, banner_text: str, raw_bytes: Optional[bytes] =
                 prod = "IIS"
             return {"fp_service": fp_service, "fp_product": prod, "fp_version": fp_version, "raw_distro": distro_raw}
 
-    # 2) token scanning in body/banners
+    # 2) HTTP response fakat Server header yok (örn. bazı LB/CDN/backend'ler)
+    if proto_ver and re.search(r"(?m)^HTTP/", b, flags=re.I) and not m_srv:
+        # Status code + reason phrase
+        m_status = re.search(r"(?m)^HTTP/[0-9\.]+ (\d{3})([ \t]+([^\r\n]+))?", b, flags=re.I)
+        if m_status:
+            code   = m_status.group(1)
+            reason = (m_status.group(3) or "").strip()
+            status_str = f"{code} {reason}".strip()
+        else:
+            status_str = ""
+        fp_service = f"HTTP {proto_ver}"
+        # Location header takes priority over bare status for the note
+        m_loc = re.search(r"(?m)^Location:\s*([^\r\n]+)", b, flags=re.I)
+        if m_loc:
+            note = f"→ {m_loc.group(1).strip()}"
+        elif status_str:
+            note = f"→ {status_str}"
+        else:
+            note = ""
+        return {"fp_service": fp_service, "fp_product": "", "fp_version": "",
+                "raw_distro": "", "fp_note": note, "fp_status": status_str}
+
+    # 3) token scanning in body/banners
     for pat, canon, g in PRODUCT_PATTERNS:
         m = pat.search(b)
         if m:
@@ -713,7 +944,7 @@ def fingerprint_banner(port: int, banner_text: str, raw_bytes: Optional[bytes] =
                     ver = m.group(g).strip()
             except Exception:
                 ver = ""
-            ver = ver or "?"
+            ver = ver or ("?" if g is not None else "")
             # special OpenSSH handling: include raw packaging token in parentheses (if present)
             if canon == "OpenSSH":
                 raw_distro_token = ""
@@ -919,6 +1150,21 @@ def fingerprint_banner(port: int, banner_text: str, raw_bytes: Optional[bytes] =
 
     return None
 
+# OpenSSH version prefix → likely Debian release (heuristic, not authoritative)
+# Debian unstable/sid packages often lack +debNNuX suffix — use SSH version as fallback signal.
+OPENSSH_DEBIAN_HINTS: List[Tuple[str, str]] = [
+    ("10.", "13"),   # Trixie / sid (2024+)
+    ("9.8", "13"),
+    ("9.7", "13"),
+    ("9.6", "13"),
+    ("9.2", "12"),   # Bookworm
+    ("8.9", "12"),
+    ("8.4", "11"),   # Bullseye
+    ("7.9", "10"),   # Buster
+    ("7.4", "9"),    # Stretch
+    ("6.7", "8"),    # Jessie
+]
+
 # ------------------------
 # OS guess (improved)
 # ------------------------
@@ -928,15 +1174,33 @@ def os_guess_from_banners(all_banners_texts: List[str]) -> Optional[Dict[str, st
     if not lower:
         return None
 
-    # Debian: prefer debNN tokens (deb11 etc)
+    # Debian: prefer debNN tokens (deb11, deb12u3, etc.) — most reliable
     m_deb_pack = re.search(r"\bdeb(\d{1,2})(?=[^\d]|$)", lower, flags=re.I)
     if m_deb_pack:
         return {"os_family": "Linux", "os_distro": "Debian", "os_version": m_deb_pack.group(1)}
 
-    # fallback Debian pattern 'Debian-11' or 'Debian 11'
-    m_debian = re.search(r"debian[-_\s]*([0-9]+(?:\.[0-9]+)?)", joined, flags=re.I)
+    # Fallback: 'Debian 11' or 'Debian GNU/Linux 12' with whitespace separator only.
+    # NOTE: 'Debian-7' (hyphen) is a package revision number, NOT a Debian release — excluded.
+    m_debian = re.search(r"\bdebian\s+(?:gnu/linux\s+)?([0-9]{1,2})\b", lower, flags=re.I)
     if m_debian:
         return {"os_family": "Linux", "os_distro": "Debian", "os_version": m_debian.group(1)}
+
+    # 'debian' is present but version couldn't be extracted from packaging tokens.
+    # Try to infer Debian release from OpenSSH version (heuristic).
+    if "debian" in lower:
+        m_ssh = re.search(r"\bopenssh[_\-/ ]?([0-9]+\.[0-9]+)", joined, flags=re.I)
+        if m_ssh:
+            ssh_ver = m_ssh.group(1)  # e.g. "10.0"
+            inferred = None
+            for prefix, deb_rel in OPENSSH_DEBIAN_HINTS:
+                if ssh_ver.startswith(prefix) or (ssh_ver + ".").startswith(prefix):
+                    inferred = deb_rel
+                    break
+            if inferred:
+                return {"os_family": "Linux", "os_distro": "Debian",
+                        "os_version": inferred, "os_version_note": f"~{inferred}, inferred from OpenSSH {ssh_ver}"}
+        # debian detected but no version signal at all
+        return {"os_family": "Linux", "os_distro": "Debian", "os_version": ""}
 
     # Ubuntu: prefer explicit 'Ubuntu X.Y'
     m_ub = re.search(r"ubuntu[^\d]*([0-9]{2}\.[0-9]+)", lower)
@@ -954,9 +1218,20 @@ def os_guess_from_banners(all_banners_texts: List[str]) -> Optional[Dict[str, st
         return {"os_family": "Windows", "os_distro": "Windows", "os_version": mapped}
 
     # CentOS/RedHat
+    # Strategy: look inside parentheticals first (e.g. Apache's "(CentOS)" or "(CentOS Linux 7.4)"),
+    # then try tight inline match. [^\d]* was too greedy — it grabbed charset=iso-8859-1 numbers.
     if "centos" in lower or "red hat" in lower or "redhat" in lower:
-        m = re.search(r"(centos|red ?hat)[^\d]*([0-9]+(?:\.[0-9]+)?)", lower)
-        return {"os_family": "Linux", "os_distro": "RHEL/CentOS", "os_version": m.group(2) if m else ""}
+        version = ""
+        # 1) Parenthetical: "(CentOS release 7.4)" / "(CentOS Linux 7)" / "(Red Hat ...)"
+        m = re.search(r"\((?:centos|red\s*hat)[^)]{0,40}?(\d{1,2}(?:\.\d+)?)[^)]*\)", joined, flags=re.I)
+        if m:
+            version = m.group(1)
+        if not version:
+            # 2) Tight inline: "CentOS 7" / "CentOS release 7.4" / "Red Hat 8"
+            m2 = re.search(r"(?:centos|red\s*hat)\s+(?:linux\s+|enterprise\s+linux\s+|release\s+)?(\d{1,2}(?:\.\d+)?)\b", joined, flags=re.I)
+            if m2:
+                version = m2.group(1)
+        return {"os_family": "Linux", "os_distro": "RHEL/CentOS", "os_version": version}
 
     # Alpine
     if "alpine" in lower:
@@ -991,20 +1266,34 @@ def console_preview_from_banner(banner_text: str, port: int) -> str:
         first = first[:77] + "..."
     return first
 
+def _sanitize_console(s: str, max_len: int = 100) -> str:
+    """Strip non-printable bytes for safe terminal display."""
+    return "".join(c if 0x20 <= ord(c) < 0x7f else "." for c in s)[:max_len]
+
 def format_line(rec: Dict[str, Any], show_preview: bool = False, preview_text: str = "") -> str:
     proto = rec.get("proto", "?").upper()
     state = rec.get("state", "?")
     port = rec.get("port", 0)
     svc = rec.get("service", "")
     proto_ver = rec.get("fp_proto_version", "") or ""
+    # responsive=False: TCP handshake succeeded but zero bytes received.
+    # Display as OPEN/NO-DATA to mirror CLOSED/FILTERED ambiguity pattern.
+    # Could be: SYN-proxy / ISP tarpit, or a real service that waits for client first.
+    display_state = state.upper()
+    if state == "open" and rec.get("responsive") is False:
+        display_state = "OPEN/NO-DATA"
     service_part = f"({svc}" + (f" / {proto_ver}" if proto_ver else "") + ")"
-    base = f"[{state.upper():14}] {proto:3} {port:5d} {service_part}"
+    base = f"[{display_state:15}] {proto:3} {port:5d} {service_part}"
     if rec.get("fp_product"):
-        ver = rec.get("fp_version", "?")
-        base += f"  / {rec.get('fp_product')} {ver}".rstrip()
+        ver = rec.get("fp_version", "")
+        prod_str = rec.get("fp_product")
+        base += f"  / {prod_str}" + (f" {ver}" if ver else "")
+    elif rec.get("fp_note"):
+        # No product but we have a note (e.g. HTTP status/redirect with no Server header)
+        base += f"  {rec.get('fp_note')}"
     else:
         if show_preview and preview_text:
-            base += f"  banner: {preview_text}"
+            base += f"  banner: {_sanitize_console(preview_text)}"
     if rec.get("note"):
         base += f"  note: {rec.get('note')}"
     return base
@@ -1023,7 +1312,7 @@ def sanitize_for_json(rec: Dict[str, Any], dns_query_for: Optional[str] = None, 
         banner_is_binary = True
         if include_banner:
             try:
-                text = raw.decode(errors="ignore")
+                text = raw.decode("latin-1")
             except Exception:
                 text = repr(raw)
             r["banner_text"] = text
@@ -1081,11 +1370,16 @@ def tcp_scan_one(ip: str, port: int, timeout: float, retries: int, need_banner: 
             if err == 0:
                 r["state"] = "open"
                 if need_banner:
+                    # Default: handshake oldu ama henüz veri gelmedi.
+                    # Bu, SYN-proxy / ISP tarpit tespitinin temel sinyali.
+                    r["responsive"] = False
                     try:
-                        text, raw = tcp_probe_banner(ip, port, timeout, host_header)
+                        # Açık socketi geçir — yeni bağlantı açılmaz
+                        text, raw = tcp_probe_banner(ip, port, timeout, host_header, existing_sock=s)
                         r["banner"] = text or ""
                         if raw:
                             r["_raw_banner"] = raw
+                            r["responsive"] = True   # gerçek byte aldık → uygulama katmanı var
                     except Exception:
                         r["banner"] = r.get("banner", "")
                 try:
@@ -1101,8 +1395,22 @@ def tcp_scan_one(ip: str, port: int, timeout: float, retries: int, need_banner: 
                 pass
         except Exception as e:
             last_err = str(e)
+    # Map last errno to a more precise state:
+    #   ECONNREFUSED       → "closed"   (real RST from target)
+    #   EAGAIN/EWOULDBLOCK → "filtered" (Python translates connect timeout to this)
+    #   ETIMEDOUT          → "filtered" (kernel-level connect timeout)
+    #   EHOSTUNREACH/ENETUNREACH → "filtered" (ICMP unreach received)
+    # Anything else (or non-int from exception path) stays "closed" as a conservative
+    # default, but we keep the raw error in _err so post-hoc analysis is possible.
     if last_err is not None:
         r["_err"] = str(last_err)
+        if isinstance(last_err, int):
+            if last_err == errno.ECONNREFUSED:
+                r["state"] = "closed"
+            elif last_err in (errno.EAGAIN, errno.EWOULDBLOCK, errno.ETIMEDOUT,
+                              errno.EHOSTUNREACH, errno.ENETUNREACH):
+                r["state"] = "filtered"
+            # else: leave as "closed" default
     return r
 
 def udp_scan_one(ip: str, port: int, timeout: float, dns_query_for: Optional[str] = None, need_banner: bool = False) -> Dict[str, Any]:
@@ -1132,10 +1440,33 @@ def udp_scan_one(ip: str, port: int, timeout: float, dns_query_for: Optional[str
             if data:
                 r["state"] = "open"
                 r["_raw_banner"] = data
-                try:
-                    r["banner"] = data.decode(errors="ignore").strip()[:4000] or repr(data)[:200]
-                except Exception:
-                    r["banner"] = repr(data)[:200]
+
+                # Protocol-specific parsing for readable banner
+                if port == 53:
+                    parsed = _parse_dns_response(data, dns_query_for or "")
+                    if parsed:
+                        r["banner"] = parsed.get("summary", "")
+                        # Stash structured fields for JSON
+                        for k in ("dns_rcode_name", "dns_ancount", "dns_answers"):
+                            if k in parsed:
+                                r[k] = parsed[k]
+                    else:
+                        r["banner"] = data.decode("latin-1").strip()[:4000]
+                elif port == 123:
+                    parsed = _parse_ntp_response(data)
+                    if parsed:
+                        r["banner"] = parsed.get("summary", "")
+                        for k in ("ntp_version", "ntp_stratum", "ntp_mode", "ntp_ref"):
+                            if k in parsed:
+                                r[k] = parsed[k]
+                    else:
+                        r["banner"] = data.decode("latin-1").strip()[:4000]
+                else:
+                    try:
+                        r["banner"] = data.decode("latin-1").strip()[:4000]
+                    except Exception:
+                        r["banner"] = repr(data)[:200]
+
                 if addr and addr[0] != ip:
                     r["note"] = f"udp response from {addr[0]}"
         except socket.timeout:
@@ -1179,13 +1510,31 @@ def main() -> None:
     elif args.udp:
         scan_udp = True; scan_tcp = True
 
+    # --- URL parsing ---
+    # args.target may be a full URL (https://example.com), plain host, or IP.
+    # Extract clean host, scheme, and any explicit port from the URL.
+    parsed = parse_target_url(args.target)
+    clean_host = parsed["host"]          # e.g. "google.com"
+    url_scheme = parsed["scheme"]        # "https" | "http" | ""
+    url_port   = parsed["port"]          # int or None
+
+    # If user gave a raw URL, show both original and resolved form
+    display_target = args.target if args.target != clean_host else clean_host
+
+    # Override port list if URL contained an explicit port and user didn't specify -p
+    if url_port and not args.ports:
+        args.ports = str(url_port)
+
     try:
-        ip = resolve_target(args.target)
+        ip = resolve_target(clean_host)
     except Exception as e:
         print(f"[!] Could not resolve target: {e}")
         return
 
-    domain_for_query = args.dns_domain if args.dns_domain else (args.target if "." in args.target else "www.example.com")
+    # host_header for HTTP probes: use clean hostname (not raw URL)
+    host_header = clean_host
+
+    domain_for_query = args.dns_domain if args.dns_domain else (clean_host if "." in clean_host else "www.example.com")
     ports = parse_ports(args.ports)
     if not ports:
         print("[!] No ports to scan.")
@@ -1202,7 +1551,7 @@ def main() -> None:
     total_tasks = len(ordered_keys)
 
     scan_type_str = "UDP only" if (scan_udp and not scan_tcp) else ("TCP+UDP" if (scan_udp and scan_tcp) else "TCP only")
-    print(f"Target: {args.target} → {ip}")
+    print(f"Target: {display_target} → {ip}")
     print(f"Scan type: {scan_type_str}  Ports: {len(ports)}  Threads: {args.threads}  Timeout: {args.timeout}s")
     start_ts = datetime.now(timezone.utc).isoformat()
     start_time = time.time()
@@ -1212,11 +1561,13 @@ def main() -> None:
     future_to_key: Dict[Any, Tuple[str,int]] = {}
     all_banner_texts: List[str] = []
 
+    actual_threads = min(args.threads, total_tasks) if total_tasks > 0 else 1
+
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_threads) as ex:
             for proto, port in ordered_keys:
                 if proto == "tcp":
-                    fut = ex.submit(tcp_scan_one, ip, port, args.timeout, args.retries, need_banner_flag, args.target)
+                    fut = ex.submit(tcp_scan_one, ip, port, args.timeout, args.retries, need_banner_flag, host_header)
                 else:
                     fut = ex.submit(udp_scan_one, ip, port, args.timeout, domain_for_query, need_banner_flag)
                 future_to_key[fut] = (proto, port)
@@ -1256,12 +1607,9 @@ def main() -> None:
                     if args.fingerprint:
                         info = fingerprint_banner(rec.get("port"), banner_text, rec.get("_raw_banner"))
                         if info:
-                            # set output fields
                             rec["fp_service"] = info.get("fp_service","")
                             rec["fp_product"] = info.get("fp_product","")
                             rec["fp_version"] = info.get("fp_version","?")
-                            # also keep proto info for display
-                            # try to keep proto version separately for nice paren printing
                             mproto = None
                             if info.get("fp_service"):
                                 mproto = re.search(r"([A-Za-z]+)\s*([0-9\.]+)", info.get("fp_service"))
@@ -1271,92 +1619,61 @@ def main() -> None:
                             else:
                                 rec["fp_protocol"] = ""
                                 rec["fp_proto_version"] = ""
+                            # fp_note de varsa al (HTTP Server-yok dalı)
+                            if info.get("fp_note"):
+                                rec["fp_note"] = info.get("fp_note")
                         else:
-                            rec["fp_service"] = rec.get("fp_service","")
-                            rec["fp_product"] = rec.get("fp_product","")
-                            rec["fp_version"] = rec.get("fp_version","")
-                            rec["fp_protocol"] = rec.get("fp_protocol","")
-                            rec["fp_proto_version"] = rec.get("fp_proto_version","")
-                        # --- MySQL-specific console preview enhancement (use raw handshake if available) ---
-                        # If this record corresponds to a MySQL port, generate a more readable preview
-                        # using fingerprint data when available. Priority:
-                        #   1) Use fp_product / fp_version from fingerprinting
-                        #   2) Otherwise, extract from the raw handshake via _parse_mysql_handshake_raw
-                        if rec.get("port") == 3306:
-                            # If fingerprinting already provided product/version, use it.
-                            if rec.get("fp_product"):
-                                proto_v = rec.get("fp_proto_version", "")
-                                proto_part = f" / {proto_v}" if proto_v else ""
-                                # example: "(MySQL / 5.5.5)  / MariaDB 11.8.3"
-                                if proto_v:
-                                    console_preview = f"MySQL{proto_part}  / {rec.get('fp_product')} {rec.get('fp_version','?')}"
-                                else:
-                                    console_preview = f"{rec.get('fp_product')} {rec.get('fp_version','?')}"
-                                show_preview_flag = True
-                            else:
-                                # Fallback: if a raw banner is available, parse the handshake directly.
-                                raw = rec.get("_raw_banner")
-                                if raw:
-                                    try:
-                                        parsed = _parse_mysql_handshake_raw(raw)
-                                        if parsed:
-                                            proto = parsed.get("proto")
-                                            ver = parsed.get("version") or parsed.get("pack") or "?"
-                                            prod = parsed.get("product") or "MySQL"
-                                            if proto:
-                                                console_preview = f"MySQL / {proto}  / {prod} {ver}"
-                                            else:
-                                                console_preview = f"{prod} {ver}"
-                                            show_preview_flag = True
-                                    except Exception:
-                                        # If parsing fails, continue silently and fall back to console_previewFromBanner.
-                                        pass
+                            rec.setdefault("fp_service", "")
+                            rec.setdefault("fp_product", "")
+                            rec.setdefault("fp_version", "")
+                            rec.setdefault("fp_protocol", "")
+                            rec.setdefault("fp_proto_version", "")
 
-                    # MySQL-specific preview using fingerprint or raw handshake
-                    if rec.get("port") == 3306:
-                        # prefer fingerprint result if present
-                        if rec.get("fp_product"):
-                            proto_v = rec.get("fp_proto_version", "")
-                            if proto_v:
-                                console_preview = f"MySQL / {proto_v}  / {rec.get('fp_product')} {rec.get('fp_version','?')}"
-                            else:
-                                console_preview = f"{rec.get('fp_product')} {rec.get('fp_version','?')}"
-                            show_preview_flag = True
-                        else:
-                            # fallback: parse raw handshake if available
-                            raw = rec.get("_raw_banner")
-                            if raw:
+                        # ISP transparent-proxy / aile filtresi tespiti:
+                        # 30x cevabındaki Location header'ı target ile alakasız bir hosta
+                        # yönlendiriyorsa, edge'de interceptor var demektir.
+                        note = rec.get("fp_note", "") or ""
+                        m_redir = re.search(r"https?://([^/\s]+)", note)
+                        if m_redir:
+                            redir_host = m_redir.group(1).split(":")[0].lower()
+                            tgt = (clean_host or "").lower()
+                            # tgt'nin altdomeni veya kendisi değilse şüpheli
+                            if tgt and redir_host != tgt \
+                               and not redir_host.endswith("." + tgt) \
+                               and not tgt.endswith("." + redir_host):
+                                rec["isp_intercept_suspected"] = True
+                                rec["isp_intercept_redirect"] = redir_host
+
+                    # --- Console preview oluştur ---
+                    # format_line fp_product varsa onu doğrudan kullanır;
+                    # console_preview sadece fp_product yokken (banner fallback) anlam taşır.
+                    console_preview = ""
+                    show_preview_flag = False
+
+                    # UDP DNS/NTP için parser zaten okunabilir summary üretti — direkt kullan
+                    if rec.get("proto") == "udp" and rec.get("port") in (53, 123) and rec.get("banner"):
+                        console_preview = rec.get("banner", "")
+                        show_preview_flag = True
+                    elif not rec.get("fp_product") and args.banner:
+                        # fp_product yok — banner'dan bir şeyler göstermeye çalış
+                        if rec.get("port") == 3306:
+                            # MySQL/MariaDB: binary handshake'ten okunabilir preview üret
+                            raw_hs = rec.get("_raw_banner")
+                            if raw_hs:
                                 try:
-                                    parsed = _parse_mysql_handshake_raw(raw)
+                                    parsed = _parse_mysql_handshake_raw(raw_hs)
                                     if parsed:
-                                        proto = parsed.get("proto")
+                                        p   = parsed.get("proto")
                                         ver = parsed.get("version") or parsed.get("pack") or "?"
                                         prod = parsed.get("product") or "MySQL"
-                                        if proto:
-                                            console_preview = f"MySQL / {proto}  / {prod} {ver}"
-                                        else:
-                                            console_preview = f"{prod} {ver}"
+                                        console_preview = (
+                                            f"MySQL / {p}  / {prod} {ver}" if p else f"{prod} {ver}"
+                                        )
                                         show_preview_flag = True
                                 except Exception:
-                                    # If parsing fails, continue silently and use the fallback.
                                     pass
-
-                    # decide console presentation (keep behaviour compatible with original)
-                    if args.fingerprint:
-                        if rec.get("fp_product"):
-                            # fingerprint produced a product — we already set show_preview_flag=True for MySQL if applicable.
-                            # For non-MySQL entries, respect original behaviour (do not show banner preview).
-                            if not show_preview_flag:
-                                show_preview_flag = False
-                        else:
-                            if args.banner:
-                                if not console_preview:
-                                    console_preview = console_preview_from_banner(banner_text, rec.get("port"))
-                                show_preview_flag = bool(console_preview)
-                    else:
-                        if args.banner:
-                            if not console_preview:
-                                console_preview = console_preview_from_banner(banner_text, rec.get("port"))
+                        if not console_preview:
+                            console_preview = console_preview_from_banner(banner_text, rec.get("port"))
                             show_preview_flag = bool(console_preview)
 
                     # attach console preview for JSON
@@ -1378,27 +1695,38 @@ def main() -> None:
         family = os_guess.get("os_family", "")
         distro = os_guess.get("os_distro", "")
         ver = os_guess.get("os_version", "")
-        # If Windows mapping returned distro == "Windows" and version already describes Windows NT,
-        # avoid repeating the word "Windows" twice.
+        note = os_guess.get("os_version_note", "")
         if family == "Windows" and distro == "Windows" and ver:
-            # ver is like "Windows NT 5.1 (XP)" — print that directly
             print(f"\nOS guess: {ver}")
         elif distro:
-            # General case: "Family (Distro Version)"
-            print(f"\nOS guess: {family} ({distro}{(' ' + ver) if ver else ''})")
+            ver_str = f" {note}" if note else (f" {ver}" if ver else "")
+            print(f"\nOS guess: {family} ({distro}{ver_str})")
         else:
             print(f"\nOS guess: {family}")
 
     # summary
     open_tcp = sum(1 for k,r in results_map.items() if r and r.get("proto")=="tcp" and r.get("state")=="open")
     open_udp = sum(1 for k,r in results_map.items() if r and r.get("proto")=="udp" and r.get("state")=="open")
+    closed_tcp = sum(1 for k,r in results_map.items() if r and r.get("proto")=="tcp" and r.get("state")=="closed")
+    filtered_tcp = sum(1 for k,r in results_map.items() if r and r.get("proto")=="tcp" and r.get("state")=="filtered")
+    responsive_tcp = sum(
+        1 for k,r in results_map.items()
+        if r and r.get("proto")=="tcp" and r.get("state")=="open" and r.get("responsive") is True
+    )
+    handshake_only_tcp = sum(
+        1 for k,r in results_map.items()
+        if r and r.get("proto")=="tcp" and r.get("state")=="open" and r.get("responsive") is False
+    )
+    intercept_flagged = sum(
+        1 for k,r in results_map.items()
+        if r and r.get("isp_intercept_suspected")
+    )
     print("\n--- Scan summary ---")
     if scan_tcp and not scan_udp:
         if args.open:
             print(f"TCP open: {open_tcp}")
         else:
-            total_tcp = sum(1 for k in results_map if k[0] == "tcp")
-            print(f"TCP open: {open_tcp}, total results: {total_tcp}")
+            print(f"TCP open: {open_tcp}, closed: {closed_tcp}, filtered: {filtered_tcp}")
     elif scan_udp and not scan_tcp:
         if args.open:
             print(f"UDP open: {open_udp}")
@@ -1409,8 +1737,14 @@ def main() -> None:
         if args.open:
             print(f"TCP open: {open_tcp}, UDP open: {open_udp}")
         else:
-            total_results = len(results_map)
-            print(f"TCP open: {open_tcp}, UDP open: {open_udp}, total results: {total_results}")
+            print(f"TCP open: {open_tcp}, closed: {closed_tcp}, filtered: {filtered_tcp}; UDP open: {open_udp}")
+    # Responsive split is only meaningful when banner-grabbing is on.
+    if args.banner and scan_tcp:
+        print(f"TCP responsive: {responsive_tcp}, no-data: {handshake_only_tcp}")
+        if handshake_only_tcp > 0 and responsive_tcp < handshake_only_tcp:
+            print(f"[!] Many no-data ports - upstream SYN-proxy or tarpit likely.")
+    if intercept_flagged > 0:
+        print(f"[!] ISP intercept suspected: {intercept_flagged} port(s) redirected off-target.")
     print(f"Duration: {end_time - start_time:.2f}s")
 
     # JSON output
@@ -1433,7 +1767,7 @@ def main() -> None:
         }
 
         out = {
-            "target": args.target,
+            "target": clean_host,
             "ip": ip,
             "started_at_utc": start_ts,
             "finished_at_utc": finish_ts,
