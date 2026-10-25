@@ -540,7 +540,7 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
             preview = mk_preview(data) if data else ""
             if not data:
                 # fallback to GET which some servers handle while HEAD ignored
-                getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: meintool/1.0\r\nConnection: close\r\n\r\n".encode()
+                getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: barescan/1.0\r\nConnection: close\r\n\r\n".encode()
                 data = _send_and_wait(s, getr, max(0.5, timeout))
                 raw = data or raw
                 preview = mk_preview(data) if data else preview
@@ -563,7 +563,7 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
                 raw = data or raw
                 preview = mk_preview(data) if data else ""
                 if not data:
-                    getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: meintool/1.0\r\nConnection: close\r\n\r\n".encode()
+                    getr = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nUser-Agent: barescan/1.0\r\nConnection: close\r\n\r\n".encode()
                     data = _send_and_wait(ss, getr, max(0.5, timeout))
                     raw = data or raw
                     preview = mk_preview(data) if data else preview
@@ -578,6 +578,23 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
         # SMTP
         elif port in (25, 587):
             data = _send_and_wait(s, b"EHLO scanner.example\r\n", max(0.5, timeout))
+            raw = data or raw
+            preview = mk_preview(data) if data else preview
+
+        # Telnet (23): server opens with IAC option negotiation (binary, 0xFF-prefixed).
+        # We do NOT negotiate back; we just read the first burst. Some Telnet daemons
+        # (incl. Windows) send a text login banner right after the IAC block, so do one
+        # extra short read to capture it. Raw bytes are preserved for fingerprint parsing.
+        elif port == 23:
+            data = _recv_select_wait(s, max(0.5, timeout), bufsize=4096)
+            if data:
+                # brief second read: banner text sometimes follows the IAC negotiation
+                try:
+                    more = _recv_select_wait(s, min(timeout, 0.4), bufsize=4096)
+                    if more:
+                        data += more
+                except Exception:
+                    pass
             raw = data or raw
             preview = mk_preview(data) if data else preview
 
@@ -783,15 +800,15 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
         # SIP (TCP 5060) - send lightweight OPTIONS (application-level); optional but useful
         elif port == 5060:
             try:
-                callid = f"meintool-{int(time.time()*1000)}"
+                callid = f"barescan-{int(time.time()*1000)}"
                 opts = (
                     f"OPTIONS sip:{host_hdr} SIP/2.0\r\n"
                     f"Via: SIP/2.0/TCP {host_hdr};branch=z9hG4bK{callid}\r\n"
-                    f"From: <sip:meintool@{host_hdr}>;tag=mt{callid}\r\n"
+                    f"From: <sip:barescan@{host_hdr}>;tag=mt{callid}\r\n"
                     f"To: <sip:{host_hdr}>\r\n"
                     f"Call-ID: {callid}\r\n"
                     f"CSeq: 1 OPTIONS\r\n"
-                    f"Contact: <sip:meintool@{host_hdr}>\r\n"
+                    f"Contact: <sip:barescan@{host_hdr}>\r\n"
                     f"Max-Forwards: 70\r\n"
                     f"Content-Length: 0\r\n\r\n"
                 ).encode()
@@ -1035,9 +1052,109 @@ def fingerprint_banner(port: int, banner_text: str, raw_bytes: Optional[bytes] =
             return {"fp_service": "SMTP", "fp_product": "Exim", "fp_version": (mm.group(1) if mm and mm.group(1) else "?"), "raw_distro": ""}
         if "postfix" in lower:
             return {"fp_service": "SMTP", "fp_product": "Postfix", "fp_version": "?", "raw_distro": ""}
+        # Microsoft ESMTP (IIS/Exchange SMTP). Banner form:
+        #   "220 host Microsoft ESMTP MAIL Service, Version: 6.0.2600.5512 ready at ..."
+        if "microsoft" in lower and ("esmtp" in lower or "smtp" in lower):
+            mm = re.search(r"version:\s*([0-9]+(?:\.[0-9]+)+)", b, flags=re.I)
+            ver = mm.group(1) if mm else "?"
+            return {"fp_service": "SMTP", "fp_product": "Microsoft ESMTP", "fp_version": ver, "raw_distro": ""}
+        if "sendmail" in lower:
+            mm = re.search(r"sendmail[/ ]?([0-9\.]+)?", lower)
+            return {"fp_service": "SMTP", "fp_product": "Sendmail", "fp_version": (mm.group(1) if mm and mm.group(1) else "?"), "raw_distro": ""}
         # fallback
         first = b.splitlines()[0].strip() if b.splitlines() else ""
         return {"fp_service": "SMTP", "fp_product": "", "fp_version": "?", "raw_distro": ""}
+
+    # 5b) Telnet: identify by the IAC (0xFF) option-negotiation prefix. If a text login
+    # banner follows, use it. Otherwise, infer the server from the IAC option SET itself:
+    # the combination/order of negotiated options differs per implementation, so it works
+    # as a passive fingerprint even when no banner text is sent (common on Windows tlntsvr,
+    # which withholds its login screen until the client answers the negotiation).
+    #
+    # Guard: a lone 0xFF byte is not enough (it appears in binary protocols too). Require a
+    # real IAC command triplet (0xFF followed by WILL/WONT/DO/DONT 0xFB-0xFE) within the head.
+    _bhead = (raw_bytes[:16] if raw_bytes else b[:16].encode("latin-1", errors="ignore"))
+    _has_iac_cmd = any(
+        _bhead[i] == 0xff and i + 1 < len(_bhead) and _bhead[i+1] in (0xfb, 0xfc, 0xfd, 0xfe)
+        for i in range(len(_bhead))
+    )
+    if port == 23 or _has_iac_cmd:
+        has_iac = _has_iac_cmd
+        # Extract any trailing text banner by structurally removing IAC triplets from the
+        # raw bytes (option bytes like 0x24 '$' or 0x27 ' are printable, so a char-class
+        # strip would leave them behind as noise). Walk the bytes, skip 3-byte IAC commands
+        # and 2-byte IAC controls, keep the rest.
+        _src = (raw_bytes if raw_bytes else b.encode("latin-1", errors="ignore"))
+        _kept = bytearray()
+        _i = 0
+        while _i < len(_src):
+            if _src[_i] == 0xff and _i + 1 < len(_src):
+                c = _src[_i+1]
+                if c in (0xfb, 0xfc, 0xfd, 0xfe):   # WILL/WONT/DO/DONT + option
+                    _i += 3
+                    continue
+                _i += 2                              # other IAC command (2 bytes)
+                continue
+            _kept.append(_src[_i])
+            _i += 1
+        text_after = _kept.decode("latin-1", errors="ignore")
+        text_after = re.sub(r"[\x00-\x08\x0e-\x1f]", "", text_after)
+        text_after = re.sub(r"\s+", " ", text_after).strip()
+        # explicit text banner wins when present
+        if "microsoft telnet" in text_after.lower() or (has_iac and port == 23 and "microsoft" in lower):
+            return {"fp_service": "Telnet", "fp_product": "Microsoft Telnet", "fp_version": "?", "raw_distro": ""}
+        if "telnetd" in text_after.lower() or "bsd" in text_after.lower():
+            mm = re.search(r"telnetd[/ ]?([0-9\.]+)?", text_after, flags=re.I)
+            return {"fp_service": "Telnet", "fp_product": "telnetd", "fp_version": (mm.group(1) if mm and mm.group(1) else "?"), "raw_distro": ""}
+        # Known BBS software banners (telnet is still the transport for the BBS scene).
+        # Synchronet: "Synchronet BBS for Linux  Version 3.20"
+        if "synchronet" in text_after.lower():
+            mm = re.search(r"synchronet.*?version\s+([0-9][0-9a-z.\-]*)", text_after, flags=re.I)
+            return {"fp_service": "Telnet", "fp_product": "Synchronet BBS", "fp_version": (mm.group(1) if mm else "?"), "raw_distro": ""}
+        if "mystic bbs" in text_after.lower() or "mystic" in text_after.lower() and "bbs" in text_after.lower():
+            mm = re.search(r"mystic.*?bbs\s+([0-9][0-9a-z.\-]*)", text_after, flags=re.I)
+            return {"fp_service": "Telnet", "fp_product": "Mystic BBS", "fp_version": (mm.group(1) if mm else "?"), "raw_distro": ""}
+        if "wwiv" in text_after.lower():
+            return {"fp_service": "Telnet", "fp_product": "WWIV BBS", "fp_version": "?", "raw_distro": ""}
+        if has_iac:
+            # No recognized text banner: infer from the IAC option set. Parse (cmd, option)
+            # triplets from the raw bytes (raw_bytes is lossless; fall back to latin-1 view).
+            src_bytes = raw_bytes if raw_bytes else b.encode("latin-1", errors="ignore")
+            opts = set()
+            i = 0
+            while i + 2 < len(src_bytes):
+                if src_bytes[i] == 0xff and src_bytes[i+1] in (0xfb, 0xfc, 0xfd, 0xfe):
+                    opts.add(src_bytes[i+2])
+                    i += 3
+                else:
+                    i += 1
+            product = "Telnet"
+            note = ""
+            # MUD extension options: MCCP (0x55/0x56), MSDP (0x45), GMCP/ATCP (0xC8/0xC9).
+            # These only appear on MUD servers, so they're a strong family signature.
+            mud_opts = opts & {0x45, 0x55, 0x56, 0xc8, 0xc9}
+            if mud_opts:
+                product = "MUD (telnet)"
+                # try to pull a name from the ASCII art welcome, if any
+                mm = re.search(r"welcome to ([A-Za-z0-9 '\-]{3,40})", text_after, flags=re.I)
+                note = f"MUD IAC ext options {sorted(hex(o) for o in mud_opts)}"
+                if mm:
+                    note = f"Welcome to {mm.group(1).strip()}"
+            # Windows tlntsvr signature: proactively negotiates AUTHENTICATION (0x25)
+            # and NEW-ENVIRON (0x27) — Unix telnetd typically does not open with AUTH.
+            elif 0x25 in opts and 0x27 in opts:
+                product = "Microsoft Telnet"
+                note = "IAC signature: DO AUTH + NEW-ENVIRON (Windows tlntsvr)"
+            elif 0x25 in opts:
+                # AUTHENTICATION offered but not the full MS set — likely Windows-family
+                product = "Microsoft Telnet"
+                note = "IAC signature: DO AUTH"
+            else:
+                # keep any genuine trailing text as a note
+                note = text_after if len(text_after) >= 4 and text_after.isprintable() else ""
+            return {"fp_service": "Telnet", "fp_product": product, "fp_version": "?", "raw_distro": note[:60]}
+
+
 
     # 6) MySQL/MariaDB handshake parsing
     # If we have raw bytes (handshake), try strict parse first (most reliable for MySQL/MariaDB)

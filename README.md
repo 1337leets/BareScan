@@ -12,6 +12,8 @@ Minimal, low-noise network service fingerprinting tool using conservative banner
 - **Evidence-based TCP state model** — distinguishes `open`, `closed`, and `filtered` using the actual `connect()` errno, instead of lumping every non-open port into one bucket
 - **`OPEN/NO-DATA` detection** — separates ports that completed a TCP handshake *and sent application data* from ports that only completed the handshake but stayed silent
 - **Network-environment awareness** — flags upstream SYN-proxies / tarpits and ISP transparent-proxy interception, so you can tell a target's real posture apart from your own network's interference
+- Telnet identification from the IAC option negotiation, which can tell Microsoft Telnet, MUD servers and some BBS software (Synchronet, Mystic, WWIV) apart even when no login banner is sent
+- SMTP fingerprints for Microsoft ESMTP and Sendmail
 - Lightweight UDP probes (DNS, NTP, SNMP, TFTP) for low-noise discovery
 - JSON output with optional base64 raw banner inclusion
 - Single-file, stdlib-first implementation — no non-stdlib dependencies
@@ -96,6 +98,7 @@ Protocol-specific probes are intentionally gentle (e.g. HEAD for HTTP, EHLO for 
 - Debian/Ubuntu packaging tokens (`debNN`, `Ubuntu X.Y`) are extracted conservatively for OS guessing. Note that `Debian-N` in an OpenSSH banner is a *package revision*, not an OS release.
 - Banner collection uses latin-1 decoding to preserve byte values 1:1 (UTF-8 with `errors=ignore` silently corrupts binary handshakes).
 - TCP state is derived from the `connect()` errno, not from a single open/closed flag.
+- Telnet servers start with IAC option negotiation. BareScan reads that first burst without answering it, removes the IAC commands to find any text banner, and otherwise guesses the server from the set of options it offered. For example the Windows telnet service asks for AUTHENTICATION and NEW-ENVIRON, which Unix telnetd usually does not.
 
 ## Security & Responsible Use
 
