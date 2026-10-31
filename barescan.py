@@ -426,14 +426,14 @@ def _extract_ubuntu_from_text(s: str) -> Optional[str]:
 def _recv_select_wait(sock: socket.socket, timeout: float, bufsize: int = 8192) -> bytes:
     """
     Daha güvenilir recv: select ile socket okunabilir olana kadar bekler (toplam `timeout` süresi boyunca),
-    ilk veri geldiğinde okur ve kısa bir 'drain' ile ek baytları toplar.
-    Return: alınan bytes (boş olabilir).
+    reads when the first data arrives, then collects extra bytes with a short 'drain'.
+    Return: the received bytes (may be empty).
     """
     if timeout is None or timeout <= 0:
         timeout = 1.0
     end = time.time() + float(timeout)
     out = b""
-    # Döngü: artan küçük beklemeler kullan (minimize busy-wait, toplam süre timeout)
+    # Loop: use small growing waits (minimize busy-wait, total time is the timeout)
     while time.time() < end:
         remaining = max(0.01, end - time.time())
         rlist, _, _ = select.select([sock], [], [], remaining)
@@ -446,7 +446,7 @@ def _recv_select_wait(sock: socket.socket, timeout: float, bufsize: int = 8192) 
                 # connection closed by peer
                 break
             out += part
-            # kısa bir zaman diliminde kalan veriyi de almaya çalış (drain)
+            # try to get the remaining data within a short time as well (drain)
             try:
                 sock.setblocking(0)
                 while True:
@@ -476,15 +476,15 @@ def _recv_select_wait(sock: socket.socket, timeout: float, bufsize: int = 8192) 
 def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[str] = None, existing_sock: Optional[socket.socket] = None) -> Tuple[str, bytes]:
     """
     Daha güvenilir banner probe:
-      - existing_sock verilirse yeni bağlantı açılmaz, mevcut bağlantı kullanılır
-      - connect, immediate select-based recv (kısa süre)
-      - port'a özgü gentle probe (HEAD, EHLO, newline, vs.)
-      - HEAD => bekle; eğer boşsa GET fallback (HTTP için)
-      - toplam bekleme davranışı `timeout` ile sınırlı
+      - if existing_sock is given, no new connection is opened and that one is used
+      - connect, immediate select-based recv (short)
+      - port-specific gentle probe (HEAD, EHLO, newline, etc.)
+      - HEAD, then wait, with a GET fallback if empty (for HTTP)
+      - total waiting is limited by `timeout`
     """
     raw = b""
     preview = ""
-    _owns_sock = existing_sock is None  # sadece kendi açtığımız soketi kapatırız
+    _owns_sock = existing_sock is None  # we only close a socket we opened ourselves
     try:
         if existing_sock is not None:
             s = existing_sock
@@ -572,7 +572,7 @@ def tcp_probe_banner(ip: str, port: int, timeout: float, host_header: Optional[s
                 except Exception:
                     pass
             except Exception:
-                # SSL handshake/wrap hatası -> sessizce devam et
+                # SSL handshake/wrap error, carry on silently
                 pass
 
         # SMTP
@@ -929,7 +929,7 @@ def fingerprint_banner(port: int, banner_text: str, raw_bytes: Optional[bytes] =
                 prod = "IIS"
             return {"fp_service": fp_service, "fp_product": prod, "fp_version": fp_version, "raw_distro": distro_raw}
 
-    # 2) HTTP response fakat Server header yok (örn. bazı LB/CDN/backend'ler)
+    # 2) HTTP response without a Server header (for example some LB/CDN/backends)
     if proto_ver and re.search(r"(?m)^HTTP/", b, flags=re.I) and not m_srv:
         # Status code + reason phrase
         m_status = re.search(r"(?m)^HTTP/[0-9\.]+ (\d{3})([ \t]+([^\r\n]+))?", b, flags=re.I)
@@ -1491,12 +1491,12 @@ def tcp_scan_one(ip: str, port: int, timeout: float, retries: int, need_banner: 
                     # Bu, SYN-proxy / ISP tarpit tespitinin temel sinyali.
                     r["responsive"] = False
                     try:
-                        # Açık socketi geçir — yeni bağlantı açılmaz
+                        # Pass the open socket, so no new connection is opened
                         text, raw = tcp_probe_banner(ip, port, timeout, host_header, existing_sock=s)
                         r["banner"] = text or ""
                         if raw:
                             r["_raw_banner"] = raw
-                            r["responsive"] = True   # gerçek byte aldık → uygulama katmanı var
+                            r["responsive"] = True   # we got real bytes, so there is an application layer
                     except Exception:
                         r["banner"] = r.get("banner", "")
                 try:
@@ -1736,7 +1736,7 @@ def main() -> None:
                             else:
                                 rec["fp_protocol"] = ""
                                 rec["fp_proto_version"] = ""
-                            # fp_note de varsa al (HTTP Server-yok dalı)
+                            # also take fp_note if present (the HTTP no-Server branch)
                             if info.get("fp_note"):
                                 rec["fp_note"] = info.get("fp_note")
                         else:
@@ -1747,32 +1747,32 @@ def main() -> None:
                             rec.setdefault("fp_proto_version", "")
 
                         # ISP transparent-proxy / aile filtresi tespiti:
-                        # 30x cevabındaki Location header'ı target ile alakasız bir hosta
-                        # yönlendiriyorsa, edge'de interceptor var demektir.
+                        # if the Location header of a 30x reply points to a host unrelated to the target,
+                        # there is an interceptor at the edge.
                         note = rec.get("fp_note", "") or ""
                         m_redir = re.search(r"https?://([^/\s]+)", note)
                         if m_redir:
                             redir_host = m_redir.group(1).split(":")[0].lower()
                             tgt = (clean_host or "").lower()
-                            # tgt'nin altdomeni veya kendisi değilse şüpheli
+                            # suspicious unless it is tgt itself or a subdomain of it
                             if tgt and redir_host != tgt \
                                and not redir_host.endswith("." + tgt) \
                                and not tgt.endswith("." + redir_host):
                                 rec["isp_intercept_suspected"] = True
                                 rec["isp_intercept_redirect"] = redir_host
 
-                    # --- Console preview oluştur ---
-                    # format_line fp_product varsa onu doğrudan kullanır;
-                    # console_preview sadece fp_product yokken (banner fallback) anlam taşır.
+                    # --- Build the console preview ---
+                    # format_line uses fp_product directly if present, so
+                    # console_preview only matters without fp_product (banner fallback).
                     console_preview = ""
                     show_preview_flag = False
 
-                    # UDP DNS/NTP için parser zaten okunabilir summary üretti — direkt kullan
+                    # for UDP DNS/NTP the parser already made a readable summary, use it directly
                     if rec.get("proto") == "udp" and rec.get("port") in (53, 123) and rec.get("banner"):
                         console_preview = rec.get("banner", "")
                         show_preview_flag = True
                     elif not rec.get("fp_product") and args.banner:
-                        # fp_product yok — banner'dan bir şeyler göstermeye çalış
+                        # no fp_product, try to show something from the banner
                         if rec.get("port") == 3306:
                             # MySQL/MariaDB: binary handshake'ten okunabilir preview üret
                             raw_hs = rec.get("_raw_banner")
